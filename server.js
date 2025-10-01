@@ -1,17 +1,49 @@
 const ModbusRTU = require("modbus-serial");
 const net = require('net');
 
-const server = net.createServer();
+const HOST = '0.0.0.0';
+
 
 const startTcpListen = (port) => {
-// Запускаем сервер
-server.listen(port, '0.0.0.0', () => {
-  console.log(`TCP сервер запущен на:${port}`);
+// Создаем TCP сервер
+const serverL = net.createServer((socket) => {
+  console.log('Клиент подключен:', socket.remoteAddress, socket.remotePort);
+  
+  // Обработка входящих данных
+  socket.on('data', (data) => {
+    const message = data.toString().trim();
+    console.log('Получено от клиента:', message);
+    
+    // Отправляем ответ
+    socket.write(`Эхо: ${message}\n`);
+    
+    // Если клиент отправил "exit", закрываем соединение
+    if (message.toLowerCase() === 'exit') {
+      socket.end('До свидания!\n');
+    }
+  });
+  
+  // Обработка закрытия соединения
+  socket.on('end', () => {
+    console.log('Клиент отключен:', socket.remoteAddress, socket.remotePort);
+  });
+  
+  // Обработка ошибок
+  socket.on('error', (err) => {
+    console.error('Ошибка сокета:', err.message);
+  });
 });
 
+// Обработка ошибок сервера
+serverL.on('error', (err) => {
+  console.error('Ошибка сервера:', err.message);
+});
 
+// Запускаем сервер
+serverL.listen(port, HOST, () => {
+  console.log(`TCP сервер запущен на ${HOST}:${port}`);
+});
 }
-
 for(let i = 5000; i < 5100;i++){
   startTcpListen(i)
 }
