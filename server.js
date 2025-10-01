@@ -19,25 +19,25 @@ const server = net.createServer((socket) => {
     client.readHoldingRegisters(0, 10, function(err, data) {
         console.log(data.data);
     });
-}, 10000);
+}, 1000);
   // Обработка входящих данных
-  socket.on('data', (data) => {
-    const message = data.toString().trim();
-    console.log(port, 'Получено от клиента:', message);
+  // socket.on('data', (data) => {
+  //   const message = data.toString().trim();
+  //   console.log(port, 'Получено от клиента:', message);
     
-    // Отправляем ответ
-    socket.write(`Эхо: ${message}\n`);
+  //   // Отправляем ответ
+  //   socket.write(`Эхо: ${message}\n`);
     
-    // Если клиент отправил "exit", закрываем соединение
-    if (message.toLowerCase() === 'exit') {
-      socket.end('До свидания!\n');
-    }
-  });
+  //   // Если клиент отправил "exit", закрываем соединение
+  //   if (message.toLowerCase() === 'exit') {
+  //     socket.end('До свидания!\n');
+  //   }
+  // });
   
   // Обработка закрытия соединения
-  socket.on('end', () => {
-    console.log('Клиент отключен:', socket.remoteAddress, socket.remotePort);
-  });
+  // socket.on('end', () => {
+  //   console.log('Клиент отключен:', socket.remoteAddress, socket.remotePort);
+  // });
   
   // Обработка ошибок
   socket.on('error', (err) => {
