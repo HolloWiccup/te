@@ -1,4 +1,4 @@
-// const ModbusRTU = require("modbus-serial");
+const ModbusRTU = require("modbus-serial");
 // const net = require('net');
 
 // const HOST = '0.0.0.0';
