@@ -22,7 +22,7 @@ console.log("Запуск Modbus TCP мастера");
 console.log("Для остановки нажмите Ctrl+C\n");
 
 class ModbusMaster {
-    constructor(host = "localhost", port = 5002, slaveId = 1) {
+    constructor(host = "0.0.0.0", port = 5002, slaveId = 1) {
         this.client = new ModbusRTU();
         this.host = host;
         this.port = port;
@@ -190,7 +190,7 @@ class ModbusMaster {
 // Получение параметров подключения из аргументов командной строки
 const args = process.argv.slice(2);
 const host = args[0] || "localhost"; // IP адрес slave компьютера
-const port = parseInt(args[1]) || 502;
+const port = parseInt(args[1]) || 5002;
 const slaveId = parseInt(args[2]) || 1;
 
 console.log("Параметры подключения:");
