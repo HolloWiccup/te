@@ -51,15 +51,18 @@ const ModbusRTU = require("modbus-serial");
 
 const HOST = '0.0.0.0';
 
-
+let flag = false;
 const startTcpListen = (port) => {
   const net = require('net');
 
+  
 // Создаем TCP сервер
 const server = net.createServer((socket) => {
   console.log('Клиент подключен:', socket.remoteAddress, socket.remotePort);
 
-  
+  if(flag) return;
+
+  flag = true;
 console.log("=== Modbus TCP Master Client ===");
 console.log("Запуск Modbus TCP мастера");
 console.log("Для остановки нажмите Ctrl+C\n");
