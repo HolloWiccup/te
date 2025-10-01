@@ -6,7 +6,7 @@ const server = net.createServer();
 const startTcpListen = (port) => {
 // Запускаем сервер
 server.listen(port, '0.0.0.0', () => {
-  console.log(`TCP сервер запущен на ${HOST}:${port}`);
+  console.log(`TCP сервер запущен на:${port}`);
 });
 
 
