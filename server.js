@@ -68,7 +68,7 @@ console.log("Запуск Modbus TCP мастера");
 console.log("Для остановки нажмите Ctrl+C\n");
 
 class ModbusMaster {
-    constructor(host = "0.0.0.0", port = remotePort, slaveId = 1) {
+    constructor(host = "0.0.0.0", port = port, slaveId = 1) {
         this.client = new ModbusRTU();
         this.host = host;
         this.port = port;
