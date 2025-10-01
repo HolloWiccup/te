@@ -1,13 +1,25 @@
+const ModbusRTU = require("modbus-serial");
+const net = require('net');
+
 const HOST = '0.0.0.0';
 
 
 const startTcpListen = (port) => {
-  const net = require('net');
+  
 
 // Создаем TCP сервер
 const server = net.createServer((socket) => {
   console.log('Клиент подключен:', socket.remoteAddress, socket.remotePort);
-  
+  const client = new ModbusRTU();
+
+  client.connectTCP("0.0.0.0", { port: port });
+  client.setID(1);
+
+  setInterval(function() {
+    client.readHoldingRegisters(0, 10, function(err, data) {
+        console.log(data.data);
+    });
+}, 10000);
   // Обработка входящих данных
   socket.on('data', (data) => {
     const message = data.toString().trim();
