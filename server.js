@@ -11,7 +11,7 @@ const server = net.createServer((socket) => {
   // Обработка входящих данных
   socket.on('data', (data) => {
     const message = data.toString().trim();
-    console.log('Получено от клиента:', message);
+    console.log(port, 'Получено от клиента:', message);
     
     // Отправляем ответ
     socket.write(`Эхо: ${message}\n`);
