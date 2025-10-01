@@ -1,23 +1,119 @@
 const ModbusRTU = require("modbus-serial");
+const net = require('net');
+
+const server = net.createServer();
+
+const startTcpListen = (port) => {
+// Запускаем сервер
+server.listen(port, '0.0.0.0', () => {
+  console.log(`TCP сервер запущен на ${HOST}:${port}`);
+});
+
+
+}
+
+for(let i = 5000; i < 5100;i++){
+  startTcpListen(i)
+}
+
+
+console.log("=== Modbus TCP Master Client ===");
+console.log("Запуск Modbus TCP мастера");
+console.log("Для остановки нажмите Ctrl+C\n");
 
 class ModbusMaster {
-    constructor() {
+    constructor(host = "localhost", port = 5002, slaveId = 1) {
         this.client = new ModbusRTU();
+        this.host = host;
+        this.port = port;
+        this.slaveId = slaveId;
         this.isConnected = false;
+        this.reconnectInterval = 5000; // 5 секунд
+        this.operationInterval = 3000; // 3 секунды между операциями
     }
 
     // Подключение к slave
-    async connect(host = "localhost", port = 5002) {
+    async connect() {
         try {
-            await this.client.connectTCP(host, { port: port });
-            this.isConnected = true;
-            this.client.setID(1); // ID slave устройства
+            console.log(`🔌 Подключение к ${this.host}:${this.port} (Slave ID: ${this.slaveId})...`);
+            
+            await this.client.connectTCP(this.host, { port: this.port });
+            this.client.setID(this.slaveId);
             this.client.setTimeout(5000);
-            console.log(`Подключено к Modbus Slave ${host}:${port}`);
+            
+            this.isConnected = true;
+            console.log("✅ Успешно подключено к Modbus Slave");
+            console.log("🔄 Начало циклического обмена данными...\n");
+            
             return true;
         } catch (err) {
-            console.error("Ошибка подключения:", err.message);
+            console.error("❌ Ошибка подключения:", err.message);
+            this.isConnected = false;
             return false;
+        }
+    }
+
+    // Автоматическое переподключение
+    async startAutoReconnect() {
+        while (true) {
+            if (!this.isConnected) {
+                await this.connect();
+            }
+            
+            if (this.isConnected) {
+                // Если подключено, ждем перед следующей проверкой
+                await this.delay(this.reconnectInterval);
+            } else {
+                // Если не подключено, ждем перед повторной попыткой
+                console.log(`🔄 Повторная попытка подключения через ${this.reconnectInterval/1000} сек...`);
+                await this.delay(this.reconnectInterval);
+            }
+        }
+    }
+
+    // Циклический обмен данными
+    async startDataExchange() {
+        let operationCounter = 0;
+        
+        while (true) {
+            if (this.isConnected) {
+                try {
+                    operationCounter++;
+                    console.log(`\n--- Операция #${operationCounter} ---`);
+                    
+                    // Чтение Holding Registers
+                    await this.readHoldingRegisters(0, 3);
+                    
+                    // Чтение Input Registers
+                    await this.readInputRegisters(0, 3);
+                    
+                    // Чтение Coils
+                    await this.readCoils(0, 5);
+                    
+                    // Запись данных (каждую 3-ю операцию)
+                    if (operationCounter % 3 === 0) {
+                        const randomValue = Math.floor(Math.random() * 1000);
+                        await this.writeRegister(10, randomValue);
+                        
+                        const coilValue = operationCounter % 2 === 0;
+                        await this.writeCoil(5, coilValue);
+                    }
+                    
+                    // Чтение записанных данных (каждую 4-ю операцию)
+                    if (operationCounter % 4 === 0) {
+                        await this.readHoldingRegisters(10, 1);
+                        await this.readCoils(5, 1);
+                    }
+                    
+                    console.log(`✅ Операция #${operationCounter} завершена`);
+                    
+                } catch (err) {
+                    console.error(`❌ Ошибка в операции #${operationCounter}:`, err.message);
+                    this.isConnected = false;
+                }
+            }
+            
+            await this.delay(this.operationInterval);
         }
     }
 
@@ -25,11 +121,10 @@ class ModbusMaster {
     async readHoldingRegisters(startAddress, length = 1) {
         try {
             const data = await this.client.readHoldingRegisters(startAddress, length);
-            console.log(`Holding Registers [${startAddress}-${startAddress + length - 1}]:`, data.data);
+            console.log(`📖 Holding Registers [${startAddress}-${startAddress + length - 1}]:`, data.data);
             return data.data;
         } catch (err) {
-            console.error("Ошибка чтения Holding Registers:", err.message);
-            return null;
+            throw new Error(`Holding Registers: ${err.message}`);
         }
     }
 
@@ -37,11 +132,10 @@ class ModbusMaster {
     async readInputRegisters(startAddress, length = 1) {
         try {
             const data = await this.client.readInputRegisters(startAddress, length);
-            console.log(`Input Registers [${startAddress}-${startAddress + length - 1}]:`, data.data);
+            console.log(`📖 Input Registers [${startAddress}-${startAddress + length - 1}]:`, data.data);
             return data.data;
         } catch (err) {
-            console.error("Ошибка чтения Input Registers:", err.message);
-            return null;
+            throw new Error(`Input Registers: ${err.message}`);
         }
     }
 
@@ -49,11 +143,10 @@ class ModbusMaster {
     async readCoils(startAddress, length = 1) {
         try {
             const data = await this.client.readCoils(startAddress, length);
-            console.log(`Coils [${startAddress}-${startAddress + length - 1}]:`, data.data);
+            console.log(`📖 Coils [${startAddress}-${startAddress + length - 1}]:`, data.data);
             return data.data;
         } catch (err) {
-            console.error("Ошибка чтения Coils:", err.message);
-            return null;
+            throw new Error(`Coils: ${err.message}`);
         }
     }
 
@@ -61,11 +154,10 @@ class ModbusMaster {
     async writeRegister(address, value) {
         try {
             await this.client.writeRegister(address, value);
-            console.log(`Записано в register ${address}: ${value}`);
+            console.log(`✏️  Записано в register ${address}: ${value}`);
             return true;
         } catch (err) {
-            console.error("Ошибка записи в register:", err.message);
-            return false;
+            throw new Error(`Write Register: ${err.message}`);
         }
     }
 
@@ -73,59 +165,54 @@ class ModbusMaster {
     async writeCoil(address, value) {
         try {
             await this.client.writeCoil(address, value);
-            console.log(`Записано в coil ${address}: ${value}`);
+            console.log(`✏️  Записано в coil ${address}: ${value}`);
             return true;
         } catch (err) {
-            console.error("Ошибка записи в coil:", err.message);
-            return false;
+            throw new Error(`Write Coil: ${err.message}`);
         }
     }
 
-    // Закрытие соединения
-    close() {
-        this.client.close();
-        this.isConnected = false;
-        console.log("Соединение закрыто");
+    // Вспомогательная функция задержки
+    delay(ms) {
+        return new Promise(resolve => setTimeout(resolve, ms));
+    }
+
+    // Запуск мастера
+    async start() {
+        // Запускаем авто-переподключение в фоне
+        this.startAutoReconnect();
+        
+        // Запускаем обмен данными
+        this.startDataExchange();
     }
 }
 
-// Пример использования мастера
-async function main() {
-    const master = new ModbusMaster();
-    
-    // Подключаемся к slave
-    const connected = await master.connect("localhost", 502);
-    if (!connected) return;
+// Получение параметров подключения из аргументов командной строки
+const args = process.argv.slice(2);
+const host = args[0] || "localhost"; // IP адрес slave компьютера
+const port = parseInt(args[1]) || 502;
+const slaveId = parseInt(args[2]) || 1;
 
-    // Выполняем различные операции
-    try {
-        // Чтение данных
-        await master.readHoldingRegisters(0, 5);    // Читаем 5 регистров начиная с 0
-        await master.readInputRegisters(0, 3);      // Читаем 3 input регистра
-        await master.readCoils(0, 5);               // Читаем 5 coils
+console.log("Параметры подключения:");
+console.log(`📍 Slave адрес: ${host}`);
+console.log(`🔌 Порт: ${port}`);
+console.log(`🆔 Slave ID: ${slaveId}`);
+console.log("\nДля изменения параметров: node client.js <host> <port> <slaveId>");
+console.log("Пример: node client.js 192.168.1.100 502 1\n");
 
-        // Запись данных
-        await master.writeRegister(10, 1234);       // Записываем в register 10
-        await master.writeCoil(5, true);            // Записываем в coil 5
+// Создаем и запускаем мастер
+const master = new ModbusMaster(host, port, slaveId);
 
-        // Читаем записанные данные
-        await master.readHoldingRegisters(10, 1);
-        await master.readCoils(5, 1);
+// Обработка graceful shutdown
+process.on('SIGINT', () => {
+    console.log('\n\n🛑 Остановка Modbus TCP Master...');
+    master.client.close();
+    console.log('✅ Modbus TCP Master остановлен');
+    process.exit(0);
+});
 
-    } catch (err) {
-        console.error("Ошибка в основном потоке:", err);
-    } finally {
-        // Закрываем соединение
-        setTimeout(() => {
-            master.close();
-        }, 2000);
-    }
-}
+// Запуск
+master.start();
 
-// Запуск примера
-if (require.main === module) {
-    console.log("Запустите сначала slave.js, затем этот файл");
-    // main(); // Раскомментируйте для автоматического запуска
-}
 
-module.exports = ModbusMaster;
+// Создаем TCP сервер
