@@ -1,305 +1,533 @@
 const net = require('net');
 
-class ModbusMasterServer {
-  constructor(port = 502) {
-    this.port = port;
-    this.slaves = new Map();
-    this.transactionId = 0;
-    
-    this.startServer();
-  }
+/**
+ * Асинхронный Modbus Master сервер для опроса ESP устройств
+ * Поддерживает Modbus RTU-like протокол поверх TCP
+ */
+class AsyncModbusMaster {
+    constructor(port = 502) {
+        this.port = port;
+        this.slaves = new Map(); // Хранилище подключенных слейвов
+        this.transactionId = 0;
+        this.server = null;
+        
+        // Статистика для мониторинга
+        this.stats = {
+            totalRequests: 0,
+            successfulResponses: 0,
+            crcErrors: 0,
+            timeoutErrors: 0
+        };
+    }
 
-  startServer() {
-    this.server = net.createServer((socket) => {
-      const clientId = `${socket.remoteAddress}:${socket.remotePort}`;
-      console.log(`[${new Date().toISOString()}] Слейв подключился: ${clientId}`);
+    /**
+     * Асинхронный запуск сервера
+     */
+    async startServer() {
+        return new Promise((resolve, reject) => {
+            try {
+                this.server = net.createServer((socket) => {
+                    this.handleNewConnection(socket).catch(console.error);
+                });
 
-      const slave = {
-        socket: socket,
-        isConnected: true,
-        pendingRequests: new Map(),
-        lastResponse: null
-      };
+                // Обработка ошибок сервера
+                this.server.on('error', (error) => {
+                    console.error(`❌ Ошибка сервера: ${error.message}`);
+                    reject(error);
+                });
 
-      this.slaves.set(clientId, slave);
+                // Запуск прослушивания порта
+                this.server.listen(this.port, () => {
+                    console.log(`🚀 Modbus Master сервер запущен на порту ${this.port}`);
+                    console.log('⏳ Ожидание подключения ESP устройств...');
+                    resolve();
+                });
 
-      socket.on('data', (data) => {
-        this.handleSlaveResponse(data, clientId);
-      });
+            } catch (error) {
+                reject(error);
+            }
+        });
+    }
 
-      socket.on('error', (err) => {
-        console.error(`Ошибка с слейвом ${clientId}:`, err.message);
-        this.cleanupSlave(clientId);
-      });
+    /**
+     * Обработка нового подключения слейва
+     */
+    async handleNewConnection(socket) {
+        const clientId = `${socket.remoteAddress}:${socket.remotePort}`;
+        
+        console.log(`\n✅ Новое подключение: ${clientId}`);
+        
+        // Создаем объект слейва
+        const slave = {
+            socket,
+            isConnected: true,
+            pendingRequests: new Map(),
+            lastResponse: null,
+            connectedAt: new Date(),
+            requestCount: 0
+        };
 
-      socket.on('close', () => {
-        console.log(`Слейв отключился: ${clientId}`);
-        this.cleanupSlave(clientId);
-      });
+        // Сохраняем слейв
+        this.slaves.set(clientId, slave);
 
-      // Начинаем опрос после подключения
-      setTimeout(() => {
-        console.log(`Начинаем опрос слейва: ${clientId}`);
-        this.startPolling(clientId);
-      }, 2000);
-    });
+        // Настраиваем обработчики событий сокета
+        this.setupSocketHandlers(socket, clientId);
 
-    this.server.listen(this.port, () => {
-      console.log(`Modbus Master/TCP сервер запущен на порту ${this.port}`);
-      console.log('Ожидание подключения ESP...');
-    });
-  }
+        // Запускаем периодический опрос после небольшой задержки
+        await this.delay(2000);
+        await this.startPollingForSlave(clientId);
+    }
 
-  // Расчет CRC для Modbus RTU
-  calculateCRC(data) {
-    let crc = 0xFFFF;
-    for (let pos = 0; pos < data.length; pos++) {
-      crc ^= data[pos];
-      for (let i = 8; i !== 0; i--) {
-        if ((crc & 0x0001) !== 0) {
-          crc >>= 1;
-          crc ^= 0xA001;
-        } else {
-          crc >>= 1;
+    /**
+     * Настройка обработчиков событий сокета
+     */
+    setupSocketHandlers(socket, clientId) {
+        // Обработка входящих данных
+        socket.on('data', async (data) => {
+            await this.handleIncomingData(data, clientId);
+        });
+
+        // Обработка ошибок
+        socket.on('error', (error) => {
+            console.error(`🔥 Ошибка сокета ${clientId}: ${error.message}`);
+            this.cleanupSlave(clientId);
+        });
+
+        // Обработка закрытия соединения
+        socket.on('close', () => {
+            console.log(`🔌 Соединение закрыто: ${clientId}`);
+            this.cleanupSlave(clientId);
+        });
+
+        // Таймаут бездействия
+        socket.setTimeout(30000, () => {
+            console.log(`⏰ Таймаут бездействия: ${clientId}`);
+            this.cleanupSlave(clientId);
+        });
+    }
+
+    /**
+     * Обработка входящих данных от слейва
+     */
+    async handleIncomingData(data, clientId) {
+        const slave = this.slaves.get(clientId);
+        if (!slave) return;
+
+        console.log(`\n📨 Получено ${data.length} байт от ${clientId}:`);
+        console.log(`   HEX: ${data.toString('hex')}`);
+
+        try {
+            // Парсим и валидируем данные
+            const parsedData = await this.parseModbusResponse(data, clientId);
+            if (!parsedData) return;
+
+            // Обрабатываем в зависимости от кода функции
+            await this.processResponseByFunctionCode(parsedData, clientId);
+
+            // Обновляем статистику
+            this.stats.successfulResponses++;
+
+        } catch (error) {
+            console.error(`💥 Ошибка обработки данных: ${error.message}`);
         }
-      }
-    }
-    return crc;
-  }
-
-  // Создание Modbus RTU-like запроса через TCP
-  createReadHoldingRegistersPdu(unitId, startAddress, quantity) {
-    // Создаем RTU-подобный запрос
-    const pdu = Buffer.alloc(6);
-    pdu.writeUInt8(unitId, 0);        // Unit ID (Device Address)
-    pdu.writeUInt8(0x03, 1);          // Function Code
-    pdu.writeUInt16BE(startAddress, 2); // Starting Address
-    pdu.writeUInt16BE(quantity, 4);   // Quantity of Registers
-    
-    // Добавляем CRC
-    const crc = this.calculateCRC(pdu);
-    const request = Buffer.alloc(8);
-    pdu.copy(request, 0);
-    request.writeUInt16LE(crc, 6); // CRC в little-endian
-
-    return request;
-  }
-
-  // Отправка запроса слейву
-  sendRequest(clientId, unitId, startAddress, quantity) {
-    const slave = this.slaves.get(clientId);
-    if (!slave || !slave.isConnected) {
-      console.error(`Слейв ${clientId} не подключен`);
-      return null;
     }
 
-    this.transactionId = (this.transactionId + 1) % 65536;
-    const transactionId = this.transactionId;
+    /**
+     * Парсинг и валидация Modbus ответа
+     */
+    async parseModbusResponse(data, clientId) {
+        // Проверяем минимальную длину ответа
+        if (data.length < 5) {
+            console.error('📏 Слишком короткий ответ');
+            return null;
+        }
 
-    const request = this.createReadHoldingRegistersPdu(unitId, startAddress, quantity);
+        // Извлекаем базовые поля
+        const unitId = data.readUInt8(0);
+        const functionCode = data.readUInt8(1);
 
-    console.log(`[${new Date().toISOString()}] Отправка RTU-запроса к ${clientId}:`, {
-      transactionId,
-      unitId,
-      functionCode: '0x03',
-      startAddress,
-      quantity,
-      rawData: request.toString('hex')
-    });
+        // Проверяем CRC
+        const crcValid = await this.validateCRC(data);
+        if (!crcValid) {
+            this.stats.crcErrors++;
+            return null;
+        }
 
-    // Сохраняем запрос в ожидании ответа
-    slave.pendingRequests.set(transactionId, {
-      timestamp: Date.now(),
-      request: request,
-      functionCode: 0x03,
-      startAddress: startAddress,
-      quantity: quantity,
-      unitId: unitId
-    });
-
-    // Отправляем запрос
-    slave.socket.write(request);
-
-    return transactionId;
-  }
-
-  // Обработка ответа от слейва
-  handleSlaveResponse(data, clientId) {
-    const slave = this.slaves.get(clientId);
-    if (!slave) return;
-
-    console.log(`[${new Date().toISOString()}] Получены сырые данные от ${clientId}:`, data.toString('hex'));
-
-    // Проверяем минимальную длину ответа
-    if (data.length < 5) {
-      console.error('Слишком короткий ответ');
-      return;
+        return {
+            unitId,
+            functionCode,
+            data: data,
+            clientId,
+            timestamp: new Date()
+        };
     }
 
-    // Парсим RTU-подобный ответ
-    const unitId = data.readUInt8(0);
-    const functionCode = data.readUInt8(1);
-
-    // Проверяем CRC
-    const receivedData = data.slice(0, data.length - 2);
-    const receivedCRC = data.readUInt16LE(data.length - 2);
-    const calculatedCRC = this.calculateCRC(receivedData);
-
-    if (receivedCRC !== calculatedCRC) {
-      console.error(`Ошибка CRC! Получено: 0x${receivedCRC.toString(16)}, Рассчитано: 0x${calculatedCRC.toString(16)}`);
-      return;
+    /**
+     * Валидация CRC ответа
+     */
+    async validateCRC(data) {
+        return new Promise((resolve) => {
+            try {
+                const receivedData = data.slice(0, data.length - 2);
+                const receivedCRC = data.readUInt16LE(data.length - 2);
+                const calculatedCRC = this.calculateCRC(receivedData);
+                
+                const isValid = receivedCRC === calculatedCRC;
+                
+                if (!isValid) {
+                    console.error(`🔍 Ошибка CRC! Ожидалось: 0x${calculatedCRC.toString(16).padStart(4, '0')}, Получено: 0x${receivedCRC.toString(16).padStart(4, '0')}`);
+                }
+                
+                resolve(isValid);
+            } catch (error) {
+                console.error(`💥 Ошибка проверки CRC: ${error.message}`);
+                resolve(false);
+            }
+        });
     }
 
-    console.log(`[${new Date().toISOString()}] Корректный ответ от ${clientId}:`, {
-      unitId,
-      functionCode: `0x${functionCode.toString(16).padStart(2, '0')}`,
-      dataLength: data.length
-    });
+    /**
+     * Обработка ответа в зависимости от кода функции
+     */
+    async processResponseByFunctionCode(parsedData, clientId) {
+        const { functionCode, data, unitId } = parsedData;
 
-    if (functionCode === 0x03) { // Read Holding Registers
-      this.handleReadHoldingRegistersResponse(clientId, data, unitId);
-    } else if (functionCode >= 0x80) { // Modbus Exception
-      const exceptionCode = data.readUInt8(2);
-      console.error(`Modbus Exception от ${clientId}: Function ${functionCode & 0x7F}, Code ${exceptionCode}`);
+        console.log(`🔧 Обработка функции: 0x${functionCode.toString(16).padStart(2, '0')}, Unit ID: ${unitId}`);
+
+        switch (functionCode) {
+            case 0x03: // Read Holding Registers
+                await this.processReadHoldingRegisters(parsedData);
+                break;
+                
+            case 0x06: // Write Single Register
+                await this.processWriteSingleRegister(parsedData);
+                break;
+                
+            default:
+                if (functionCode >= 0x80) {
+                    await this.processExceptionResponse(parsedData);
+                } else {
+                    console.log(`🤔 Необрабатываемая функция: 0x${functionCode.toString(16)}`);
+                }
+        }
     }
 
-    // Находим соответствующий запрос (по unitId и функции)
-    this.cleanupPendingRequest(slave, unitId, functionCode);
-  }
+    /**
+     * Обработка чтения регистров хранения
+     */
+    async processReadHoldingRegisters(parsedData) {
+        const { data, clientId, unitId } = parsedData;
+        
+        if (data.length < 5) {
+            console.error('📏 Недостаточно данных для чтения регистров');
+            return;
+        }
 
-  handleReadHoldingRegistersResponse(clientId, data, unitId) {
-    if (data.length < 5) {
-      console.error('Слишком короткий PDU для чтения регистров');
-      return;
+        const byteCount = data.readUInt8(2);
+        const registers = [];
+
+        // Извлекаем значения регистров
+        for (let i = 0; i < byteCount / 2; i++) {
+            if (data.length >= 5 + i * 2) {
+                const registerValue = data.readUInt16BE(3 + i * 2);
+                registers.push(registerValue);
+            }
+        }
+
+        // Сохраняем последний ответ
+        await this.updateSlaveLastResponse(clientId, registers, unitId);
+
+        // Форматируем красивый вывод
+        await this.printRegistersData(clientId, registers, unitId);
     }
 
-    const byteCount = data.readUInt8(2);
-    const registers = [];
-    
-    // Проверяем, что данных достаточно
-    if (data.length >= 3 + byteCount + 2) { // +2 для CRC
-      for (let i = 0; i < byteCount / 2; i++) {
-        registers.push(data.readUInt16BE(3 + i * 2));
-      }
+    /**
+     * Обработка записи одиночного регистра
+     */
+    async processWriteSingleRegister(parsedData) {
+        const { data, clientId, unitId } = parsedData;
+        
+        if (data.length >= 6) {
+            const address = data.readUInt16BE(2);
+            const value = data.readUInt16BE(4);
+            
+            console.log(`✏️  Запись регистра - Слейв: ${clientId}`);
+            console.log(`   Адрес: ${address}, Значение: ${value} (0x${value.toString(16).padStart(4, '0')})`);
+        }
     }
 
-    // Сохраняем последний ответ
-    const slave = this.slaves.get(clientId);
-    if (slave) {
-      slave.lastResponse = {
-        timestamp: new Date().toISOString(),
-        registers: registers,
-        unitId: unitId
-      };
+    /**
+     * Обработка исключительных ответов
+     */
+    async processExceptionResponse(parsedData) {
+        const { functionCode, data, clientId } = parsedData;
+        const exceptionCode = data.readUInt8(2);
+        
+        console.error(`🚫 Modbus исключение от ${clientId}:`);
+        console.error(`   Функция: 0x${(functionCode & 0x7F).toString(16)}, Код ошибки: ${exceptionCode}`);
     }
 
-    // Форматируем вывод
-    let logMessage = `[${new Date().toISOString()}] 📊 ДАННЫЕ ОТ ${clientId} (Unit ID: ${unitId}):`;
-    
-    if (registers.length > 0) {
-      logMessage += `\n   Регистры: [${registers.join(', ')}]`;
-      
-      // Дополнительная информация для отдельных регистров
-      registers.forEach((value, index) => {
-        logMessage += `\n   Регистр ${index}: ${value} (0x${value.toString(16).padStart(4, '0')})`;
-      });
-    } else {
-      logMessage += `\n   Нет данных регистров`;
+    /**
+     * Обновление последнего ответа слейва
+     */
+    async updateSlaveLastResponse(clientId, registers, unitId) {
+        const slave = this.slaves.get(clientId);
+        if (slave) {
+            slave.lastResponse = {
+                timestamp: new Date().toISOString(),
+                registers: [...registers], // Копируем массив
+                unitId,
+                requestCount: slave.requestCount
+            };
+        }
     }
 
-    console.log(logMessage);
-    console.log('─'.repeat(60)); // Разделитель для удобства чтения
-  }
+    /**
+     * Красивый вывод данных регистров
+     */
+    async printRegistersData(clientId, registers, unitId) {
+        let output = `\n📊 ДАННЫЕ ОТ ${clientId} (Unit ID: ${unitId}):\n`;
+        
+        if (registers.length > 0) {
+            output += `   📍 Регистры [${registers.length}]: ${registers.join(', ')}\n`;
+            
+            // Детальная информация по каждому регистру
+            registers.forEach((value, index) => {
+                const binary = value.toString(2).padStart(16, '0');
+                output += `   🔸 Регистр ${index}: ${value} | 0x${value.toString(16).padStart(4, '0')} | 0b${binary}\n`;
+            });
+        } else {
+            output += `   ⚠️  Нет данных регистров\n`;
+        }
 
-  cleanupPendingRequest(slave, unitId, functionCode) {
-    // Находим и удаляем ожидающий запрос с соответствующими параметрами
-    for (const [transactionId, request] of slave.pendingRequests) {
-      if (request.unitId === unitId && request.functionCode === functionCode) {
-        slave.pendingRequests.delete(transactionId);
-        break;
-      }
+        console.log(output);
+        console.log('─'.repeat(70));
     }
-  }
 
-  // Публичные методы для работы с Modbus
-  readHoldingRegisters(clientId, startAddress, quantity, unitId = 1) {
-    return this.sendRequest(clientId, unitId, startAddress, quantity);
-  }
-
-  // Запуск периодического опроса
-  startPolling(clientId) {
-    // Опрашиваем регистры как в коде ESP
-    setInterval(() => {
-      // Читаем 1 регистр начиная с адреса 10 (как в коде ESP)
-      this.readHoldingRegisters(clientId, 10, 1, 1);
-    }, 3000);
-
-    // Дополнительный опрос других регистров
-    setInterval(() => {
-      this.readHoldingRegisters(clientId, 0, 5, 1);
-    }, 5000);
-
-    console.log(`Периодический опрос запущен для ${clientId}`);
-  }
-
-  cleanupSlave(clientId) {
-    const slave = this.slaves.get(clientId);
-    if (slave) {
-      slave.isConnected = false;
-      if (slave.socket) {
-        slave.socket.destroy();
-      }
-      this.slaves.delete(clientId);
-      console.log(`Слейв ${clientId} удален из списка`);
+    /**
+     * Расчет CRC для Modbus RTU
+     */
+    calculateCRC(data) {
+        let crc = 0xFFFF;
+        
+        for (let pos = 0; pos < data.length; pos++) {
+            crc ^= data[pos];
+            
+            for (let i = 8; i !== 0; i--) {
+                if ((crc & 0x0001) !== 0) {
+                    crc >>= 1;
+                    crc ^= 0xA001;
+                } else {
+                    crc >>= 1;
+                }
+            }
+        }
+        
+        return crc;
     }
-  }
 
-  getConnectedSlaves() {
-    return Array.from(this.slaves.keys());
-  }
+    /**
+     * Создание Modbus RTU запроса
+     */
+    createReadHoldingRegistersRequest(unitId, startAddress, quantity) {
+        // Создаем основной PDU
+        const pdu = Buffer.alloc(6);
+        pdu.writeUInt8(unitId, 0);        // Unit ID
+        pdu.writeUInt8(0x03, 1);          // Function Code
+        pdu.writeUInt16BE(startAddress, 2); // Starting Address
+        pdu.writeUInt16BE(quantity, 4);   // Quantity
+        
+        // Добавляем CRC
+        const crc = this.calculateCRC(pdu);
+        const request = Buffer.alloc(pdu.length + 2);
+        pdu.copy(request, 0);
+        request.writeUInt16LE(crc, pdu.length); // CRC в little-endian
 
-  getSlaveStatus(clientId) {
-    const slave = this.slaves.get(clientId);
-    if (!slave) return null;
-    
-    return {
-      isConnected: slave.isConnected,
-      pendingRequests: slave.pendingRequests.size,
-      lastResponse: slave.lastResponse
-    };
-  }
+        return request;
+    }
+
+    /**
+     * Асинхронная отправка запроса слейву
+     */
+    async sendRequest(clientId, unitId, startAddress, quantity) {
+        const slave = this.slaves.get(clientId);
+        
+        if (!slave || !slave.isConnected) {
+            throw new Error(`Слейв ${clientId} не подключен`);
+        }
+
+        // Создаем запрос
+        const request = this.createReadHoldingRegistersRequest(unitId, startAddress, quantity);
+        const transactionId = ++this.transactionId;
+
+        // Логируем отправку
+        console.log(`\n📤 Отправка запроса к ${clientId}:`);
+        console.log(`   🔹 Transaction: ${transactionId}`);
+        console.log(`   🔹 Unit ID: ${unitId}`);
+        console.log(`   🔹 Функция: 0x03 (Read Holding Registers)`);
+        console.log(`   🔹 Адрес: ${startAddress}, Количество: ${quantity}`);
+        console.log(`   🔹 HEX: ${request.toString('hex')}`);
+
+        // Сохраняем в ожидающие запросы
+        slave.pendingRequests.set(transactionId, {
+            timestamp: Date.now(),
+            request,
+            startAddress,
+            quantity,
+            unitId
+        });
+
+        slave.requestCount++;
+        this.stats.totalRequests++;
+
+        // Отправляем асинхронно
+        return new Promise((resolve, reject) => {
+            try {
+                slave.socket.write(request, (error) => {
+                    if (error) {
+                        reject(error);
+                    } else {
+                        resolve(transactionId);
+                    }
+                });
+            } catch (error) {
+                reject(error);
+            }
+        });
+    }
+
+    /**
+     * Запуск периодического опроса для слейва
+     */
+    async startPollingForSlave(clientId) {
+        console.log(`\n🔄 Запуск периодического опроса для: ${clientId}`);
+        
+        // Опрос регистра 10 (как в коде ESP)
+        setInterval(async () => {
+            try {
+                await this.sendRequest(clientId, 1, 10, 1);
+            } catch (error) {
+                console.error(`💥 Ошибка опроса регистра 10: ${error.message}`);
+            }
+        }, 3000);
+
+        // Дополнительный опрос группы регистров
+        setInterval(async () => {
+            try {
+                await this.sendRequest(clientId, 1, 0, 5);
+            } catch (error) {
+                console.error(`💥 Ошибка опроса регистров 0-4: ${error.message}`);
+            }
+        }, 5000);
+    }
+
+    /**
+     * Утилитарная функция задержки
+     */
+    async delay(ms) {
+        return new Promise(resolve => setTimeout(resolve, ms));
+    }
+
+    /**
+     * Очистка ресурсов слейва
+     */
+    cleanupSlave(clientId) {
+        const slave = this.slaves.get(clientId);
+        if (slave) {
+            slave.isConnected = false;
+            if (slave.socket && !slave.socket.destroyed) {
+                slave.socket.destroy();
+            }
+            this.slaves.delete(clientId);
+            console.log(`🧹 Ресурсы слейва ${clientId} очищены`);
+        }
+    }
+
+    /**
+     * Получение статистики сервера
+     */
+    getStatistics() {
+        return {
+            ...this.stats,
+            connectedSlaves: this.slaves.size,
+            uptime: process.uptime()
+        };
+    }
+
+    /**
+     * Получение списка подключенных слейвов
+     */
+    getConnectedSlaves() {
+        return Array.from(this.slaves.keys());
+    }
+
+    /**
+     * Грейсфул shutdown сервера
+     */
+    async shutdown() {
+        console.log('\n🛑 Завершение работы Modbus Master...');
+        
+        // Закрываем все соединения
+        for (const [clientId] of this.slaves) {
+            this.cleanupSlave(clientId);
+        }
+        
+        // Закрываем сервер
+        if (this.server) {
+            await new Promise((resolve) => {
+                this.server.close(() => resolve());
+            });
+        }
+        
+        console.log('✅ Modbus Master остановлен');
+    }
 }
 
-// Использование
-const modbusServer = new ModbusMasterServer(502);
-
-// Функция для вывода статуса всех подключенных слейвов
-function printStatus() {
-  const slaves = modbusServer.getConnectedSlaves();
-  console.log('\n' + '='.repeat(70));
-  console.log(`СТАТУС: ${slaves.length} слейв(ов) подключено`);
-  
-  slaves.forEach(clientId => {
-    const status = modbusServer.getSlaveStatus(clientId);
-    console.log(`📡 ${clientId}:`);
-    console.log(`   Подключен: ${status.isConnected ? '✅' : '❌'}`);
-    console.log(`   Ожидающих ответов: ${status.pendingRequests}`);
-    if (status.lastResponse) {
-      console.log(`   Последний ответ: ${status.lastResponse.timestamp}`);
-      console.log(`   Данные: [${status.lastResponse.registers.join(', ')}]`);
+/**
+ * Основная асинхронная функция
+ */
+async function main() {
+    const modbusMaster = new AsyncModbusMaster(502);
+    
+    try {
+        // Запуск сервера
+        await modbusMaster.startServer();
+        
+        // Периодический вывод статистики
+        setInterval(() => {
+            const stats = modbusMaster.getStatistics();
+            console.log('\n' + '='.repeat(80));
+            console.log('📈 СТАТИСТИКА СЕРВЕРА:');
+            console.log(`   Подключено слейвов: ${stats.connectedSlaves}`);
+            console.log(`   Всего запросов: ${stats.totalRequests}`);
+            console.log(`   Успешных ответов: ${stats.successfulResponses}`);
+            console.log(`   Ошибок CRC: ${stats.crcErrors}`);
+            console.log(`   Аптайм: ${Math.floor(stats.uptime)} сек.`);
+            console.log('='.repeat(80));
+        }, 10000);
+        
+        // Обработка graceful shutdown
+        process.on('SIGINT', async () => {
+            console.log('\n🛑 Получен сигнал завершения...');
+            await modbusMaster.shutdown();
+            process.exit(0);
+        });
+        
+        process.on('SIGTERM', async () => {
+            console.log('\n🛑 Получен сигнал терминации...');
+            await modbusMaster.shutdown();
+            process.exit(0);
+        });
+        
+    } catch (error) {
+        console.error(`💥 Критическая ошибка: ${error.message}`);
+        process.exit(1);
     }
-  });
-  console.log('='.repeat(70) + '\n');
 }
 
-// Периодический вывод статуса
-setInterval(printStatus, 15000);
+// Запуск приложения
+if (require.main === module) {
+    main().catch(console.error);
+}
 
-// Обработка завершения работы
-process.on('SIGINT', () => {
-  console.log('\nЗавершение работы...');
-  modbusServer.getConnectedSlaves().forEach(clientId => {
-    modbusServer.cleanupSlave(clientId);
-  });
-  process.exit(0);
-});
+module.exports = AsyncModbusMaster;
