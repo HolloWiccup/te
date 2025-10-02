@@ -50,25 +50,43 @@ class ModbusMasterServer {
     });
   }
 
-  // Создание Modbus TCP PDU
-  createReadHoldingRegistersPdu(startAddress, quantity) {
-    const buffer = Buffer.alloc(5);
-    buffer.writeUInt8(0x03, 0); // Function Code
-    buffer.writeUInt16BE(startAddress, 1); // Starting Address
-    buffer.writeUInt16BE(quantity, 3); // Quantity of Registers
-    return buffer;
+  // Расчет CRC для Modbus RTU
+  calculateCRC(data) {
+    let crc = 0xFFFF;
+    for (let pos = 0; pos < data.length; pos++) {
+      crc ^= data[pos];
+      for (let i = 8; i !== 0; i--) {
+        if ((crc & 0x0001) !== 0) {
+          crc >>= 1;
+          crc ^= 0xA001;
+        } else {
+          crc >>= 1;
+        }
+      }
+    }
+    return crc;
   }
 
-  createWriteSingleRegisterPdu(address, value) {
-    const buffer = Buffer.alloc(5);
-    buffer.writeUInt8(0x06, 0); // Function Code
-    buffer.writeUInt16BE(address, 1); // Address
-    buffer.writeUInt16BE(value, 3); // Value
-    return buffer;
+  // Создание Modbus RTU-like запроса через TCP
+  createReadHoldingRegistersPdu(unitId, startAddress, quantity) {
+    // Создаем RTU-подобный запрос
+    const pdu = Buffer.alloc(6);
+    pdu.writeUInt8(unitId, 0);        // Unit ID (Device Address)
+    pdu.writeUInt8(0x03, 1);          // Function Code
+    pdu.writeUInt16BE(startAddress, 2); // Starting Address
+    pdu.writeUInt16BE(quantity, 4);   // Quantity of Registers
+    
+    // Добавляем CRC
+    const crc = this.calculateCRC(pdu);
+    const request = Buffer.alloc(8);
+    pdu.copy(request, 0);
+    request.writeUInt16LE(crc, 6); // CRC в little-endian
+
+    return request;
   }
 
   // Отправка запроса слейву
-  sendRequest(clientId, unitId, pdu) {
+  sendRequest(clientId, unitId, startAddress, quantity) {
     const slave = this.slaves.get(clientId);
     if (!slave || !slave.isConnected) {
       console.error(`Слейв ${clientId} не подключен`);
@@ -78,31 +96,25 @@ class ModbusMasterServer {
     this.transactionId = (this.transactionId + 1) % 65536;
     const transactionId = this.transactionId;
 
-    // Создаем Modbus TCP заголовок
-    const header = Buffer.alloc(7);
-    header.writeUInt16BE(transactionId, 0); // Transaction ID
-    header.writeUInt16BE(0x0000, 2); // Protocol ID (0 для Modbus)
-    header.writeUInt16BE(pdu.length + 1, 4); // Length
-    header.writeUInt8(unitId, 6); // Unit ID
+    const request = this.createReadHoldingRegistersPdu(unitId, startAddress, quantity);
 
-    // Объединяем заголовок и PDU
-    const request = Buffer.concat([header, pdu]);
-
-    console.log(`[${new Date().toISOString()}] Отправка запроса к ${clientId}:`, {
+    console.log(`[${new Date().toISOString()}] Отправка RTU-запроса к ${clientId}:`, {
       transactionId,
       unitId,
-      functionCode: `0x${pdu.readUInt8(0).toString(16).padStart(2, '0')}`,
-      startAddress: pdu.readUInt16BE(1),
-      quantity: pdu.readUInt16BE(3)
+      functionCode: '0x03',
+      startAddress,
+      quantity,
+      rawData: request.toString('hex')
     });
 
     // Сохраняем запрос в ожидании ответа
     slave.pendingRequests.set(transactionId, {
       timestamp: Date.now(),
       request: request,
-      functionCode: pdu.readUInt8(0),
-      startAddress: pdu.readUInt16BE(1),
-      quantity: pdu.readUInt16BE(3)
+      functionCode: 0x03,
+      startAddress: startAddress,
+      quantity: quantity,
+      unitId: unitId
     });
 
     // Отправляем запрос
@@ -116,67 +128,58 @@ class ModbusMasterServer {
     const slave = this.slaves.get(clientId);
     if (!slave) return;
 
-    // Парсим заголовок MBAP
-    if (data.length < 7) {
+    console.log(`[${new Date().toISOString()}] Получены сырые данные от ${clientId}:`, data.toString('hex'));
+
+    // Проверяем минимальную длину ответа
+    if (data.length < 5) {
       console.error('Слишком короткий ответ');
       return;
     }
 
-    const transactionId = data.readUInt16BE(0);
-    const protocolId = data.readUInt16BE(2);
-    const length = data.readUInt16BE(4);
-    const unitId = data.readUInt8(6);
+    // Парсим RTU-подобный ответ
+    const unitId = data.readUInt8(0);
+    const functionCode = data.readUInt8(1);
 
-    // Проверяем protocol ID
-    if (protocolId !== 0) {
-      console.error('Неверный Protocol ID');
+    // Проверяем CRC
+    const receivedData = data.slice(0, data.length - 2);
+    const receivedCRC = data.readUInt16LE(data.length - 2);
+    const calculatedCRC = this.calculateCRC(receivedData);
+
+    if (receivedCRC !== calculatedCRC) {
+      console.error(`Ошибка CRC! Получено: 0x${receivedCRC.toString(16)}, Рассчитано: 0x${calculatedCRC.toString(16)}`);
       return;
     }
 
-    // Проверяем длину
-    if (data.length !== length + 6) {
-      console.error('Неверная длина пакета');
-      return;
-    }
-
-    // Извлекаем PDU
-    const pdu = data.slice(7);
-    const functionCode = pdu.readUInt8(0);
-
-    // Получаем информацию о запросе
-    const pendingRequest = slave.pendingRequests.get(transactionId);
+    console.log(`[${new Date().toISOString()}] Корректный ответ от ${clientId}:`, {
+      unitId,
+      functionCode: `0x${functionCode.toString(16).padStart(2, '0')}`,
+      dataLength: data.length
+    });
 
     if (functionCode === 0x03) { // Read Holding Registers
-      this.handleReadHoldingRegistersResponse(clientId, transactionId, pdu, pendingRequest);
+      this.handleReadHoldingRegistersResponse(clientId, data, unitId);
     } else if (functionCode >= 0x80) { // Modbus Exception
-      const exceptionCode = pdu.readUInt8(1);
+      const exceptionCode = data.readUInt8(2);
       console.error(`Modbus Exception от ${clientId}: Function ${functionCode & 0x7F}, Code ${exceptionCode}`);
-    } else {
-      console.log(`[${new Date().toISOString()}] Ответ от ${clientId}:`, {
-        transactionId,
-        unitId,
-        functionCode: `0x${functionCode.toString(16).padStart(2, '0')}`,
-        data: pdu.toString('hex')
-      });
     }
 
-    // Удаляем запрос из ожидания
-    slave.pendingRequests.delete(transactionId);
+    // Находим соответствующий запрос (по unitId и функции)
+    this.cleanupPendingRequest(slave, unitId, functionCode);
   }
 
-  handleReadHoldingRegistersResponse(clientId, transactionId, pdu, requestInfo) {
-    if (pdu.length < 2) {
+  handleReadHoldingRegistersResponse(clientId, data, unitId) {
+    if (data.length < 5) {
       console.error('Слишком короткий PDU для чтения регистров');
       return;
     }
 
-    const byteCount = pdu.readUInt8(1);
+    const byteCount = data.readUInt8(2);
     const registers = [];
     
     // Проверяем, что данных достаточно
-    if (pdu.length >= 2 + byteCount) {
+    if (data.length >= 3 + byteCount + 2) { // +2 для CRC
       for (let i = 0; i < byteCount / 2; i++) {
-        registers.push(pdu.readUInt16BE(2 + i * 2));
+        registers.push(data.readUInt16BE(3 + i * 2));
       }
     }
 
@@ -186,53 +189,52 @@ class ModbusMasterServer {
       slave.lastResponse = {
         timestamp: new Date().toISOString(),
         registers: registers,
-        startAddress: requestInfo ? requestInfo.startAddress : 0,
-        quantity: requestInfo ? requestInfo.quantity : 0
+        unitId: unitId
       };
     }
 
     // Форматируем вывод
-    let logMessage = `[${new Date().toISOString()}] 📊 ДАННЫЕ ОТ ${clientId}:`;
-    
-    if (requestInfo) {
-      logMessage += ` Адрес ${requestInfo.startAddress}, кол-во: ${requestInfo.quantity}`;
-    }
+    let logMessage = `[${new Date().toISOString()}] 📊 ДАННЫЕ ОТ ${clientId} (Unit ID: ${unitId}):`;
     
     if (registers.length > 0) {
       logMessage += `\n   Регистры: [${registers.join(', ')}]`;
       
       // Дополнительная информация для отдельных регистров
       registers.forEach((value, index) => {
-        const address = requestInfo ? requestInfo.startAddress + index : index;
-        logMessage += `\n   Регистр ${address}: ${value} (0x${value.toString(16).padStart(4, '0')})`;
+        logMessage += `\n   Регистр ${index}: ${value} (0x${value.toString(16).padStart(4, '0')})`;
       });
     } else {
       logMessage += `\n   Нет данных регистров`;
     }
 
     console.log(logMessage);
-    console.log('─'.repeat(50)); // Разделитель для удобства чтения
+    console.log('─'.repeat(60)); // Разделитель для удобства чтения
+  }
+
+  cleanupPendingRequest(slave, unitId, functionCode) {
+    // Находим и удаляем ожидающий запрос с соответствующими параметрами
+    for (const [transactionId, request] of slave.pendingRequests) {
+      if (request.unitId === unitId && request.functionCode === functionCode) {
+        slave.pendingRequests.delete(transactionId);
+        break;
+      }
+    }
   }
 
   // Публичные методы для работы с Modbus
   readHoldingRegisters(clientId, startAddress, quantity, unitId = 1) {
-    const pdu = this.createReadHoldingRegistersPdu(startAddress, quantity);
-    return this.sendRequest(clientId, unitId, pdu);
-  }
-
-  writeSingleRegister(clientId, address, value, unitId = 1) {
-    const pdu = this.createWriteSingleRegisterPdu(address, value);
-    return this.sendRequest(clientId, unitId, pdu);
+    return this.sendRequest(clientId, unitId, startAddress, quantity);
   }
 
   // Запуск периодического опроса
   startPolling(clientId) {
-    // Опрашиваем регистр 10 (как в коде ESP)
+    // Опрашиваем регистры как в коде ESP
     setInterval(() => {
+      // Читаем 1 регистр начиная с адреса 10 (как в коде ESP)
       this.readHoldingRegisters(clientId, 10, 1, 1);
     }, 3000);
 
-    // Можно добавить опрос других регистров
+    // Дополнительный опрос других регистров
     setInterval(() => {
       this.readHoldingRegisters(clientId, 0, 5, 1);
     }, 5000);
@@ -274,7 +276,7 @@ const modbusServer = new ModbusMasterServer(502);
 // Функция для вывода статуса всех подключенных слейвов
 function printStatus() {
   const slaves = modbusServer.getConnectedSlaves();
-  console.log('\n' + '='.repeat(60));
+  console.log('\n' + '='.repeat(70));
   console.log(`СТАТУС: ${slaves.length} слейв(ов) подключено`);
   
   slaves.forEach(clientId => {
@@ -287,11 +289,11 @@ function printStatus() {
       console.log(`   Данные: [${status.lastResponse.registers.join(', ')}]`);
     }
   });
-  console.log('='.repeat(60) + '\n');
+  console.log('='.repeat(70) + '\n');
 }
 
 // Периодический вывод статуса
-setInterval(printStatus, 10000);
+setInterval(printStatus, 15000);
 
 // Обработка завершения работы
 process.on('SIGINT', () => {
