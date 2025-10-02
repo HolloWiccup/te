@@ -1,308 +1,198 @@
-const ModbusRTU = require("modbus-serial");
-// const net = require('net');
+const net = require('net');
 
-// const HOST = '0.0.0.0';
-
-
-// const startTcpListen = (port) => {
-// // Создаем TCP сервер
-// const serverL = net.createServer((socket) => {
-//   console.log('Клиент подключен:', socket.remoteAddress, socket.remotePort);
-  
-//   // Обработка входящих данных
-//   socket.on('data', (data) => {
-//     const message = data.toString().trim();
-//     console.log('Получено от клиента:', message);
+class ModbusMasterServer {
+  constructor(port = 502) {
+    this.port = port;
+    this.slaves = new Map();
+    this.transactionId = 0;
     
-//     // Отправляем ответ
-//     socket.write(`Эхо: ${message}\n`);
+    this.startServer();
+  }
+
+  startServer() {
+    this.server = net.createServer((socket) => {
+      const clientId = `${socket.remoteAddress}:${socket.remotePort}`;
+      console.log(`[${new Date().toISOString()}] Слейв подключился: ${clientId}`);
+
+      const slave = {
+        socket: socket,
+        isConnected: true,
+        pendingRequests: new Map()
+      };
+
+      this.slaves.set(clientId, slave);
+
+      socket.on('data', (data) => {
+        this.handleSlaveResponse(data, clientId);
+      });
+
+      socket.on('error', (err) => {
+        console.error(`Ошибка с слейвом ${clientId}:`, err.message);
+        this.cleanupSlave(clientId);
+      });
+
+      socket.on('close', () => {
+        console.log(`Слейв отключился: ${clientId}`);
+        this.cleanupSlave(clientId);
+      });
+
+      // Тестовый запрос при подключении
+      setTimeout(() => {
+        this.readHoldingRegisters(clientId, 0, 10);
+      }, 1000);
+    });
+
+    this.server.listen(this.port, () => {
+      console.log(`Modbus Master/TCP сервер запущен на порту ${this.port}`);
+    });
+  }
+
+  // Создание Modbus TCP PDU
+  createReadHoldingRegistersPdu(startAddress, quantity) {
+    const buffer = Buffer.alloc(5);
+    buffer.writeUInt8(0x03, 0); // Function Code
+    buffer.writeUInt16BE(startAddress, 1); // Starting Address
+    buffer.writeUInt16BE(quantity, 3); // Quantity of Registers
+    return buffer;
+  }
+
+  createWriteSingleRegisterPdu(address, value) {
+    const buffer = Buffer.alloc(5);
+    buffer.writeUInt8(0x06, 0); // Function Code
+    buffer.writeUInt16BE(address, 1); // Address
+    buffer.writeUInt16BE(value, 3); // Value
+    return buffer;
+  }
+
+  // Отправка запроса слейву
+  sendRequest(clientId, unitId, pdu) {
+    const slave = this.slaves.get(clientId);
+    if (!slave || !slave.isConnected) {
+      throw new Error(`Слейв ${clientId} не подключен`);
+    }
+
+    this.transactionId = (this.transactionId + 1) % 65536;
+    const transactionId = this.transactionId;
+
+    // Создаем Modbus TCP заголовок
+    const header = Buffer.alloc(7);
+    header.writeUInt16BE(transactionId, 0); // Transaction ID
+    header.writeUInt16BE(0x0000, 2); // Protocol ID (0 для Modbus)
+    header.writeUInt16BE(pdu.length + 1, 4); // Length
+    header.writeUInt8(unitId, 6); // Unit ID
+
+    // Объединяем заголовок и PDU
+    const request = Buffer.concat([header, pdu]);
+
+    console.log(`[${new Date().toISOString()}] Отправка запроса к ${clientId}:`, request.toString('hex'));
+
+    // Сохраняем запрос в ожидании ответа
+    slave.pendingRequests.set(transactionId, {
+      timestamp: Date.now(),
+      request: request
+    });
+
+    // Отправляем запрос
+    slave.socket.write(request);
+
+    return transactionId;
+  }
+
+  // Обработка ответа от слейва
+  handleSlaveResponse(data, clientId) {
+    console.log(`[${new Date().toISOString()}] Получен ответ от ${clientId}:`, data.toString('hex'));
+
+    const slave = this.slaves.get(clientId);
+    if (!slave) return;
+
+    // Парсим заголовок MBAP
+    if (data.length < 7) {
+      console.error('Слишком короткий ответ');
+      return;
+    }
+
+    const transactionId = data.readUInt16BE(0);
+    const protocolId = data.readUInt16BE(2);
+    const length = data.readUInt16BE(4);
+    const unitId = data.readUInt8(6);
+
+    // Проверяем protocol ID
+    if (protocolId !== 0) {
+      console.error('Неверный Protocol ID');
+      return;
+    }
+
+    // Проверяем длину
+    if (data.length !== length + 6) {
+      console.error('Неверная длина пакета');
+      return;
+    }
+
+    // Извлекаем PDU
+    const pdu = data.slice(7);
+    const functionCode = pdu.readUInt8(0);
+
+    console.log(`[${new Date().toISOString()}] Разобранный ответ от ${clientId}:`, {
+      transactionId,
+      unitId,
+      functionCode: functionCode.toString(16),
+      data: pdu.toString('hex')
+    });
+
+    // Обрабатываем в зависимости от function code
+    if (functionCode === 0x03) { // Read Holding Registers
+      this.handleReadHoldingRegistersResponse(clientId, transactionId, pdu);
+    } else if (functionCode >= 0x80) { // Modbus Exception
+      const exceptionCode = pdu.readUInt8(1);
+      console.error(`Modbus Exception: Function ${functionCode & 0x7F}, Code ${exceptionCode}`);
+    }
+
+    // Удаляем запрос из ожидания
+    slave.pendingRequests.delete(transactionId);
+  }
+
+  handleReadHoldingRegistersResponse(clientId, transactionId, pdu) {
+    const byteCount = pdu.readUInt8(1);
+    const registers = [];
     
-//     // Если клиент отправил "exit", закрываем соединение
-//     if (message.toLowerCase() === 'exit') {
-//       socket.end('До свидания!\n');
-//     }
-//   });
-  
-//   // Обработка закрытия соединения
-//   socket.on('end', () => {
-//     console.log('Клиент отключен:', socket.remoteAddress, socket.remotePort);
-//   });
-  
-//   // Обработка ошибок
-//   socket.on('error', (err) => {
-//     console.error('Ошибка сокета:', err.message);
-//   });
-// });
-
-// // Обработка ошибок сервера
-// serverL.on('error', (err) => {
-//   console.error('Ошибка сервера:', err.message);
-// });
-
-// // Запускаем сервер
-// serverL.listen(port, HOST, () => {
-//   console.log(`TCP сервер запущен на ${HOST}:${port}`);
-// });
-// }
-// for(let i = 5000; i < 5100;i++){
-//   startTcpListen(i)
-// }
-
-
-const HOST = '0.0.0.0';
-
-let flag = false;
-const startTcpListen = (port) => {
-  const net = require('net');
-
-  
-// Создаем TCP сервер
-const server = net.createServer((socket) => {
-  console.log('Клиент подключен:', socket.remoteAddress, socket.remotePort);
-
-  if(flag) return;
-
-  flag = true;
-console.log("=== Modbus TCP Master Client ===");
-console.log("Запуск Modbus TCP мастера");
-console.log("Для остановки нажмите Ctrl+C\n");
-
-class ModbusMaster {
-    constructor(host = "0.0.0.0", port = port, slaveId = 1) {
-        this.client = new ModbusRTU();
-        this.host = host;
-        this.port = port;
-        this.slaveId = slaveId;
-        this.isConnected = false;
-        this.reconnectInterval = 5000; // 5 секунд
-        this.operationInterval = 3000; // 3 секунды между операциями
+    for (let i = 0; i < byteCount / 2; i++) {
+      registers.push(pdu.readUInt16BE(2 + i * 2));
     }
 
-    // Подключение к slave
-    async connect() {
-        try {
-            console.log(`🔌 Подключение к ${this.host}:${this.port} (Slave ID: ${this.slaveId})...`);
-            
-            await this.client.connectTCP(this.host, { port: this.port });
-            this.client.setID(this.slaveId);
-            this.client.setTimeout(5000);
-            
-            this.isConnected = true;
-            console.log("✅ Успешно подключено к Modbus Slave");
-            console.log("🔄 Начало циклического обмена данными...\n");
-            
-            return true;
-        } catch (err) {
-            console.error("❌ Ошибка подключения:", err.message);
-            this.isConnected = false;
-            return false;
-        }
-    }
+    console.log(`[${new Date().toISOString()}] Прочитаны регистры от ${clientId}:`, registers);
+  }
 
-    // Автоматическое переподключение
-    async startAutoReconnect() {
-        while (true) {
-            if (!this.isConnected) {
-                await this.connect();
-            }
-            
-            if (this.isConnected) {
-                // Если подключено, ждем перед следующей проверкой
-                await this.delay(this.reconnectInterval);
-            } else {
-                // Если не подключено, ждем перед повторной попыткой
-                console.log(`🔄 Повторная попытка подключения через ${this.reconnectInterval/1000} сек...`);
-                await this.delay(this.reconnectInterval);
-            }
-        }
-    }
+  // Публичные методы для работы с Modbus
+  readHoldingRegisters(clientId, startAddress, quantity, unitId = 1) {
+    const pdu = this.createReadHoldingRegistersPdu(startAddress, quantity);
+    return this.sendRequest(clientId, unitId, pdu);
+  }
 
-    // Циклический обмен данными
-    async startDataExchange() {
-        let operationCounter = 0;
-        
-        while (true) {
-            if (this.isConnected) {
-                try {
-                    operationCounter++;
-                    console.log(`\n--- Операция #${operationCounter} ---`);
-                    
-                    // Чтение Holding Registers
-                    await this.readHoldingRegisters(0, 3);
-                    
-                    // Чтение Input Registers
-                    await this.readInputRegisters(0, 3);
-                    
-                    // Чтение Coils
-                    await this.readCoils(0, 5);
-                    
-                    // Запись данных (каждую 3-ю операцию)
-                    if (operationCounter % 3 === 0) {
-                        const randomValue = Math.floor(Math.random() * 1000);
-                        await this.writeRegister(10, randomValue);
-                        
-                        const coilValue = operationCounter % 2 === 0;
-                        await this.writeCoil(5, coilValue);
-                    }
-                    
-                    // Чтение записанных данных (каждую 4-ю операцию)
-                    if (operationCounter % 4 === 0) {
-                        await this.readHoldingRegisters(10, 1);
-                        await this.readCoils(5, 1);
-                    }
-                    
-                    console.log(`✅ Операция #${operationCounter} завершена`);
-                    
-                } catch (err) {
-                    console.error(`❌ Ошибка в операции #${operationCounter}:`, err.message);
-                    this.isConnected = false;
-                }
-            }
-            
-            await this.delay(this.operationInterval);
-        }
-    }
+  writeSingleRegister(clientId, address, value, unitId = 1) {
+    const pdu = this.createWriteSingleRegisterPdu(address, value);
+    return this.sendRequest(clientId, unitId, pdu);
+  }
 
-    // Чтение Holding Registers (функция 3)
-    async readHoldingRegisters(startAddress, length = 1) {
-        try {
-            const data = await this.client.readHoldingRegisters(startAddress, length);
-            console.log(`📖 Holding Registers [${startAddress}-${startAddress + length - 1}]:`, data.data);
-            return data.data;
-        } catch (err) {
-            throw new Error(`Holding Registers: ${err.message}`);
-        }
+  cleanupSlave(clientId) {
+    const slave = this.slaves.get(clientId);
+    if (slave) {
+      slave.isConnected = false;
+      this.slaves.delete(clientId);
     }
+  }
 
-    // Чтение Input Registers (функция 4)
-    async readInputRegisters(startAddress, length = 1) {
-        try {
-            const data = await this.client.readInputRegisters(startAddress, length);
-            console.log(`📖 Input Registers [${startAddress}-${startAddress + length - 1}]:`, data.data);
-            return data.data;
-        } catch (err) {
-            throw new Error(`Input Registers: ${err.message}`);
-        }
-    }
-
-    // Чтение Coils (функция 1)
-    async readCoils(startAddress, length = 1) {
-        try {
-            const data = await this.client.readCoils(startAddress, length);
-            console.log(`📖 Coils [${startAddress}-${startAddress + length - 1}]:`, data.data);
-            return data.data;
-        } catch (err) {
-            throw new Error(`Coils: ${err.message}`);
-        }
-    }
-
-    // Запись в Holding Register (функция 6)
-    async writeRegister(address, value) {
-        try {
-            await this.client.writeRegister(address, value);
-            console.log(`✏️  Записано в register ${address}: ${value}`);
-            return true;
-        } catch (err) {
-            throw new Error(`Write Register: ${err.message}`);
-        }
-    }
-
-    // Запись в Coil (функция 5)
-    async writeCoil(address, value) {
-        try {
-            await this.client.writeCoil(address, value);
-            console.log(`✏️  Записано в coil ${address}: ${value}`);
-            return true;
-        } catch (err) {
-            throw new Error(`Write Coil: ${err.message}`);
-        }
-    }
-
-    // Вспомогательная функция задержки
-    delay(ms) {
-        return new Promise(resolve => setTimeout(resolve, ms));
-    }
-
-    // Запуск мастера
-    async start() {
-        // Запускаем авто-переподключение в фоне
-        this.startAutoReconnect();
-        
-        // Запускаем обмен данными
-        this.startDataExchange();
-    }
+  getConnectedSlaves() {
+    return Array.from(this.slaves.keys());
+  }
 }
 
-// Получение параметров подключения из аргументов командной строки
-const args = process.argv.slice(2);
-const host = args[0] || "localhost"; // IP адрес slave компьютера
-const port = parseInt(args[1]) || 5002;
-const slaveId = parseInt(args[2]) || 1;
+// Использование
+const modbusServer = new ModbusMasterServer(502);
 
-console.log("Параметры подключения:");
-console.log(`📍 Slave адрес: ${host}`);
-console.log(`🔌 Порт: ${port}`);
-console.log(`🆔 Slave ID: ${slaveId}`);
-console.log("\nДля изменения параметров: node client.js <host> <port> <slaveId>");
-console.log("Пример: node client.js 192.168.1.100 502 1\n");
-
-// Создаем и запускаем мастер
-const master = new ModbusMaster(host, port, slaveId);
-
-// Обработка graceful shutdown
-process.on('SIGINT', () => {
-    console.log('\n\n🛑 Остановка Modbus TCP Master...');
-    master.client.close();
-    console.log('✅ Modbus TCP Master остановлен');
-    process.exit(0);
-});
-
-// Запуск
-master.start();
-  
-  // Обработка входящих данных
-  socket.on('data', (data) => {
-    const message = data.toString().trim();
-    console.log('Получено от клиента:', message);
-    
-    // Отправляем ответ
-    socket.write(`Эхо: ${message}\n`);
-    
-    // Если клиент отправил "exit", закрываем соединение
-    if (message.toLowerCase() === 'exit') {
-      socket.end('До свидания!\n');
-    }
+// Пример периодического опроса
+setInterval(() => {
+  const slaves = modbusServer.getConnectedSlaves();
+  slaves.forEach(clientId => {
+    modbusServer.readHoldingRegisters(clientId, 0, 5);
   });
-  
-  // Обработка закрытия соединения
-  socket.on('end', () => {
-    console.log('Клиент отключен:', socket.remoteAddress, socket.remotePort);
-  });
-  
-  // Обработка ошибок
-  socket.on('error', (err) => {
-    console.error('Ошибка сокета:', err.message);
-  });
-});
-
-// Обработка ошибок сервера
-server.on('error', (err) => {
-  console.error('Ошибка сервера:', err.message);
-});
-
-// Запускаем сервер
-server.listen(port, HOST, () => {
-  console.log(`TCP сервер запущен на ${HOST}:${port}`);
-});
-
-
-}
-
-for(let i = 5000; i < 5100;i++){
-  startTcpListen(i)
-}
-
-
-
-
-// Создаем TCP сервер
+}, 5000);
